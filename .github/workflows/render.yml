@@ -34,7 +34,7 @@ jobs:
           cat > scripts/tts.mjs <<'EOF_FILE'
           import fs from 'node:fs';
           import crypto from 'node:crypto';
-          import { execFileSync } from 'node:child_process';
+          import { execFileSync, spawnSync } from 'node:child_process';
 
           const KEY = process.env.PAXA_API_KEY;
           if (!KEY) { console.error('Missing PAXA_API_KEY secret'); process.exit(1); }
@@ -60,12 +60,28 @@ jobs:
             }
           }
 
+          function speechSegments(f, a) {
+            const r = spawnSync('ffmpeg', ['-i', f, '-af', 'silencedetect=noise=-33dB:d=0.12', '-f', 'null', '-'], { encoding: 'utf8' });
+            const log = r.stderr || '';
+            const sil = [];
+            let cur = null;
+            for (const m of log.matchAll(/silence_(start|end): (-?[\d.]+)/g)) {
+              const v = Math.max(0, parseFloat(m[2]));
+              if (m[1] === 'start') cur = v; else { sil.push([cur ?? 0, v]); cur = null; }
+            }
+            if (cur !== null) sil.push([cur, a]);
+            const segs = []; let pos = 0;
+            for (const [s, e] of sil) { if (s - pos > 0.05) segs.push([pos, s]); pos = Math.max(pos, e); }
+            if (a - pos > 0.05) segs.push([pos, a]);
+            return segs.length ? segs : [[0, a]];
+          }
+
           const raws = [];
           for (let i = 0; i < cfg.scenes.length; i++) {
             const hash = crypto.createHash('md5').update(cfg.voice + cfg.direction + cfg.scenes[i]).digest('hex').slice(0, 8);
             const f = `build/raw/${i}-${hash}.mp3`;
             await synth(cfg.scenes[i], f);
-            raws.push({ f, a: probe(f) });
+            const a = probe(f); raws.push({ f, a, segs: speechSegments(f, a) });
           }
 
           const PAD = 0.25, LASTPAD = 0.7;
@@ -83,7 +99,7 @@ jobs:
             const dur = speech + (i === raws.length - 1 ? LASTPAD : PAD);
             const out = `build/scene_${i}.wav`;
             execFileSync('ffmpeg', ['-y', '-i', r.f, '-af', `atempo=${tempo},apad=whole_dur=${dur}`, '-t', String(dur), '-ar', '44100', '-ac', '1', out], { stdio: 'ignore' });
-            scenes.push({ text: cfg.scenes[i], start: t, dur, speech });
+            scenes.push({ text: cfg.scenes[i], start: t, dur, speech, segs: r.segs.map(([x, y]) => [x / tempo, y / tempo]) });
             list.push(`file 'scene_${i}.wav'`);
             t += dur;
           });
@@ -245,12 +261,27 @@ jobs:
             }}
           ];
           function lerp(a,b,t){return a+(b-a)*t}
+          function mapTime(f,segs,sp){
+           if(!segs||!segs.length) return f*sp*.92;
+           const tot=segs.reduce((a,x)=>a+(x[1]-x[0]),0); let r=f*tot;
+           for(const x of segs){const L=x[1]-x[0]; if(r<=L) return x[0]+r; r-=L;}
+           return segs[segs.length-1][1];
+          }
 
           /* ---------- Timeline wiring ---------- */
           let TL=null, nodes=[];
+          const KEEP=['นายกรัฐมนตรี','ประเทศไทย','โรงพยาบาล','โรงเรียน','งบประมาณ','ประชาชน','ผลประโยชน์','ทับซ้อน','ตรวจสอบ','คอมเมนต์','ติดตาม','ซื่อสัตย์'];
           function split(text){
            const sg=new Intl.Segmenter('th',{granularity:'word'});
-           return [...sg.segment(text)].map(s=>s.segment);
+           const tk=[...sg.segment(text)].map(x=>x.segment), out=[];
+           for(let i=0;i<tk.length;){
+            let took=false;
+            for(let j=Math.min(tk.length,i+6);j>i+1;j--){
+             if(KEEP.includes(tk.slice(i,j).join(''))){out.push(tk.slice(i,j).join(''));i=j;took=true;break;}
+            }
+            if(!took){out.push(tk[i]);i++;}
+           }
+           return out;
           }
           window.setTimeline=function(tl){
            TL=tl; const host=document.getElementById('scenes'); host.innerHTML=''; nodes=[];
@@ -260,16 +291,21 @@ jobs:
             const txt=document.createElement('div'); txt.className='txt';
             const inner=document.createElement('div');
             const phrases=s.text.split(/\s+/).filter(Boolean);
-            const total=phrases.join('').length; let acc=0; const spans=[];
-            phrases.forEach((ph,pi)=>{
+            const wl=w=>w.replace(/[\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]/g,'').length||1;
+            const total=phrases.map(ph=>split(ph).reduce((a,w)=>a+wl(w),0)).reduce((a,b)=>a+b,0);
+            let acc=0; const spans=[], boxes=[];
+            phrases.forEach(ph=>{
              const box=document.createElement('span'); box.style.cssText='display:inline-block;opacity:1;white-space:nowrap;margin:0 .18em';
              split(ph).forEach(w=>{const sp=document.createElement('span'); sp.textContent=w; box.appendChild(sp);
-              spans.push({sp,at:(acc/total)*s.speech*.92}); acc+=w.length;});
-             inner.appendChild(box);
+              spans.push({sp,at:Math.max(0,mapTime(acc/total,s.segs,s.speech)-.08)}); acc+=wl(w);});
+             inner.appendChild(box); boxes.push(box);
             });
             txt.appendChild(inner); el.appendChild(art); el.appendChild(txt); host.appendChild(el);
-            nodes.push({el,art,spans});
+            nodes.push({el,art,spans,boxes});
            });
+           nodes.forEach(n=>{n.el.style.display='block';
+            n.boxes.forEach(b=>{if(b.getBoundingClientRect().width>880){b.style.whiteSpace='normal';b.style.display='inline';}});
+            n.el.style.display='none';});
           };
           window.seek=function(T){
            TL.scenes.forEach((s,i)=>{
@@ -305,4 +341,3 @@ jobs:
         with:
           name: video
           path: out/video.mp4
-          
