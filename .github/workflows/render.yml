@@ -1,0 +1,308 @@
+name: Render video
+on: workflow_dispatch
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Write project files
+        run: |
+          mkdir -p scripts build out
+          cat > package.json <<'EOF_FILE'
+          { "name": "whatif-video", "private": true, "type": "module", "dependencies": { "playwright": "1.49.1" } }
+          EOF_FILE
+          cat > script.json <<'EOF_FILE'
+          {
+            "voice": "khanomkrok",
+            "model": "paxa-tts-flash-v2",
+            "direction": "[warm, unhurried]",
+            "targetSeconds": 34,
+            "scenes": [
+              "ถ้าวันหนึ่ง ประเทศไทยมีนายกรัฐมนตรีที่ซื่อสัตย์จริงๆ จะเกิดอะไรขึ้น?",
+              "งบประมาณทุกบาท เปิดให้ประชาชนตรวจสอบได้ ทุกโครงการ ทุกสัญญา",
+              "ไม่มีเรื่องใต้โต๊ะ ไม่มีผลประโยชน์ทับซ้อน ใครทำผิด ก็รับผิดเท่ากัน",
+              "เงินภาษีของเรา ถูกใช้กับโรงพยาบาล โรงเรียน และถนน อย่างคุ้มค่า",
+              "แต่คนดีคนเดียวไม่พอ ต้องมีระบบที่ตรวจสอบได้ ทุกยุคทุกสมัย",
+              "แล้วคุณล่ะ คิดว่าอะไรควรเปลี่ยนก่อน? เขียนความเห็นไว้ในคอมเมนต์ แล้วกดติดตามไว้ ตอนหน้าห้ามพลาด"
+            ]
+          }
+          EOF_FILE
+          cat > scripts/tts.mjs <<'EOF_FILE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+
+          const KEY = process.env.PAXA_API_KEY;
+          if (!KEY) { console.error('Missing PAXA_API_KEY secret'); process.exit(1); }
+          const cfg = JSON.parse(fs.readFileSync('script.json', 'utf8'));
+          fs.mkdirSync('build/raw', { recursive: true });
+
+          const probe = f => parseFloat(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f]).toString());
+
+          async function synth(text, file) {
+            if (fs.existsSync(file)) return;
+            const attempts = [`${cfg.direction} ${text}`, text];
+            for (let i = 0; i < attempts.length; i++) {
+              const r = await fetch('https://api.paxalabs.com/v1/tts', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: attempts[i], voice: cfg.voice, model: cfg.model })
+              });
+              if (r.ok) { fs.writeFileSync(file, Buffer.from(await r.arrayBuffer())); return; }
+              const body = await r.text();
+              console.error(`TTS ${r.status}: ${body}`);
+              if (i === attempts.length - 1) throw new Error('TTS failed');
+              console.error('Retrying without direction tag...');
+            }
+          }
+
+          const raws = [];
+          for (let i = 0; i < cfg.scenes.length; i++) {
+            const hash = crypto.createHash('md5').update(cfg.voice + cfg.direction + cfg.scenes[i]).digest('hex').slice(0, 8);
+            const f = `build/raw/${i}-${hash}.mp3`;
+            await synth(cfg.scenes[i], f);
+            raws.push({ f, a: probe(f) });
+          }
+
+          const PAD = 0.25, LASTPAD = 0.7;
+          const pads = PAD * (raws.length - 1) + LASTPAD;
+          const sumA = raws.reduce((s, r) => s + r.a, 0);
+          let tempo = sumA / (cfg.targetSeconds - pads);
+          tempo = Math.min(1.25, Math.max(0.85, tempo));
+          console.log(`Raw speech ${sumA.toFixed(2)}s, tempo x${tempo.toFixed(3)}`);
+
+          let t = 0;
+          const scenes = [];
+          const list = [];
+          raws.forEach((r, i) => {
+            const speech = r.a / tempo;
+            const dur = speech + (i === raws.length - 1 ? LASTPAD : PAD);
+            const out = `build/scene_${i}.wav`;
+            execFileSync('ffmpeg', ['-y', '-i', r.f, '-af', `atempo=${tempo},apad=whole_dur=${dur}`, '-t', String(dur), '-ar', '44100', '-ac', '1', out], { stdio: 'ignore' });
+            scenes.push({ text: cfg.scenes[i], start: t, dur, speech });
+            list.push(`file 'scene_${i}.wav'`);
+            t += dur;
+          });
+          fs.writeFileSync('build/list.txt', list.join('\n'));
+          execFileSync('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', 'build/list.txt', '-c', 'copy', 'build/audio.wav'], { stdio: 'ignore' });
+          fs.writeFileSync('build/timeline.json', JSON.stringify({ scenes, total: t }, null, 1));
+          console.log(`Total ${t.toFixed(2)}s (target ${cfg.targetSeconds}s)`);
+          EOF_FILE
+          cat > scripts/render.mjs <<'EOF_FILE'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { execFileSync } from 'node:child_process';
+
+          const FPS = 30;
+          const tl = JSON.parse(fs.readFileSync('build/timeline.json', 'utf8'));
+          fs.rmSync('build/frames', { recursive: true, force: true });
+          fs.mkdirSync('build/frames', { recursive: true });
+          fs.mkdirSync('out', { recursive: true });
+
+          const browser = await chromium.launch();
+          const page = await browser.newPage({ viewport: { width: 1080, height: 1920 }, deviceScaleFactor: 1 });
+          page.on('pageerror', e => { console.error('PAGE ERROR', e); process.exit(1); });
+          await page.goto('file://' + path.resolve('index.html'));
+          await page.evaluate(() => document.fonts.ready);
+          await page.evaluate(t => window.setTimeline(t), tl);
+
+          const n = Math.round(tl.total * FPS);
+          for (let i = 0; i < n; i++) {
+            await page.evaluate(t => window.seek(t), i / FPS);
+            await page.screenshot({ path: `build/frames/${String(i).padStart(5, '0')}.png` });
+            if (i % 150 === 0) console.log(`frame ${i}/${n}`);
+          }
+          await browser.close();
+
+          execFileSync('ffmpeg', ['-y', '-framerate', String(FPS), '-i', 'build/frames/%05d.png', '-i', 'build/audio.wav',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '17', '-preset', 'medium',
+            '-c:a', 'aac', '-b:a', '192k', '-t', String(tl.total), '-movflags', '+faststart', 'out/video.mp4'], { stdio: 'inherit' });
+          EOF_FILE
+          cat > index.html <<'EOF_FILE'
+          <!doctype html>
+          <html lang="th"><head><meta charset="utf-8">
+          <style>
+          :root{--ink:#0a1228;--ink2:#15295c;--gold:#f2c14e;--red:#d6334a;--paper:#f7f4ec;--green:#3ddc97}
+          *{box-sizing:border-box;margin:0;padding:0}
+          html,body{width:1080px;height:1920px;overflow:hidden;background:var(--ink)}
+          #stage{position:relative;width:1080px;height:1920px;overflow:hidden;color:#fff;
+           background:radial-gradient(900px 700px at 50% 25%,var(--ink2),var(--ink) 75%);
+           font-family:'Noto Sans Thai','Sarabun','Tahoma',sans-serif;font-weight:700}
+          #flag{position:absolute;left:90px;top:90px;width:900px;height:30px;display:flex;flex-direction:column;border-radius:6px;overflow:hidden}
+          #flag i{display:block}
+          #chip{position:absolute;left:0;width:100%;top:150px;text-align:center;font-size:40px;color:var(--gold);letter-spacing:1px}
+          .scene{position:absolute;inset:0;opacity:0}
+          .art{position:absolute;left:0;top:230px;width:1080px;height:900px}
+          .art svg{width:1080px;height:900px;overflow:visible}
+          .txt{position:absolute;left:90px;top:1170px;width:900px;height:470px;display:flex;align-items:center;justify-content:center;
+           text-align:center;font-size:66px;line-height:1.45;text-shadow:0 4px 24px rgba(0,0,0,.45)}
+          .txt span span{display:inline-block;opacity:0;white-space:pre}
+          #bar{position:absolute;left:90px;top:1740px;width:900px;height:10px;border-radius:5px;background:rgba(255,255,255,.14)}
+          #bar b{display:block;height:100%;width:0;border-radius:5px;background:var(--gold)}
+          </style></head>
+          <body><div id="stage">
+          <div id="flag"><i style="flex:1;background:#d6334a"></i><i style="flex:1;background:#f7f4ec"></i><i style="flex:2;background:#27407f"></i><i style="flex:1;background:#f7f4ec"></i><i style="flex:1;background:#d6334a"></i></div>
+          <div id="chip">WHAT IF ไทยมีนายกที่ซื่อสัตย์</div>
+          <div id="scenes"></div>
+          <div id="bar"><b></b></div>
+          </div>
+          <script>
+          const clamp=(x,a=0,b=1)=>Math.min(b,Math.max(a,x));
+          const seg=(t,a,b)=>clamp((t-a)/(b-a));
+          const E={out:t=>1-Math.pow(1-t,3),io:t=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2,
+           back:t=>{const c=1.70158;return 1+(c+1)*Math.pow(t-1,3)+c*Math.pow(t-1,2)}};
+          const $=(root,s)=>root.querySelector(s);
+          const GOLD='#f2c14e',INK='#0a1228';
+
+          /* ---------- Art per scene: {svg, update(root,t)} ---------- */
+          const ART=[
+           { svg:`<svg viewBox="0 0 1080 900"><defs><radialGradient id="g1"><stop offset="0" stop-color="${GOLD}" stop-opacity=".55"/><stop offset="1" stop-color="${GOLD}" stop-opacity="0"/></radialGradient></defs>
+            <circle class="glow" cx="540" cy="450" r="400" fill="url(#g1)"/>
+            <circle class="r1" cx="540" cy="450" r="270" fill="none" stroke="${GOLD}" stroke-width="7" stroke-dasharray="34 24"/>
+            <circle cx="540" cy="450" r="340" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="3"/>
+            <text class="q" x="540" y="600" text-anchor="middle" font-size="440" fill="${GOLD}" font-family="'Noto Sans Thai',sans-serif" font-weight="700">?</text></svg>`,
+            update(r,t){
+             $(r,'.r1').setAttribute('transform',`rotate(${t*22} 540 450)`);
+             $(r,'.glow').setAttribute('opacity',.75+.25*Math.sin(t*3));
+             const s=E.back(seg(t,0,.7));
+             $(r,'.q').setAttribute('transform',`translate(540 450) scale(${s}) translate(-540 -450)`);
+            }},
+           { svg:`<svg viewBox="0 0 1080 900"><rect x="170" y="70" width="740" height="740" rx="44" fill="#f7f4ec"/>
+            <rect x="170" y="70" width="740" height="130" rx="44" fill="${GOLD}"/><rect x="170" y="150" width="740" height="50" fill="${GOLD}"/>
+            <text x="540" y="157" text-anchor="middle" font-size="56" fill="${INK}" font-family="'Noto Sans Thai',sans-serif" font-weight="700">งบประมาณแผ่นดิน</text>
+            ${[0,1,2,3].map(i=>`<g class="row" data-i="${i}"><rect x="240" y="${260+i*130}" width="440" height="30" rx="15" fill="#cfd6e6"/><rect class="fill" x="240" y="${260+i*130}" width="0" height="30" rx="15" fill="#27407f"/>
+            <circle cx="770" cy="${275+i*130}" r="42" fill="#e6f9f0"/><path class="ck" d="M748 ${277+i*130} l16 17 l32 -38" fill="none" stroke="#1fb877" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="100" stroke-dashoffset="100"/></g>`).join('')}</svg>`,
+            update(r,t){
+             r.querySelectorAll('.row').forEach((g,i)=>{
+              const a=.5+i*.5, p=E.out(seg(t,a,a+.55)), c=seg(t,a+.45,a+.8);
+              $(g,'.fill').setAttribute('width',440*p);
+              $(g,'.ck').setAttribute('stroke-dashoffset',100*(1-E.out(c)));
+             });
+            }},
+           { svg:`<svg viewBox="0 0 1080 900"><rect x="380" y="780" width="320" height="44" rx="22" fill="#27407f"/>
+            <rect x="525" y="250" width="30" height="540" fill="#f7f4ec"/>
+            <g class="beam"><rect x="240" y="238" width="600" height="24" rx="12" fill="${GOLD}"/></g>
+            <circle cx="540" cy="250" r="34" fill="${GOLD}"/>
+            <g class="L"><path class="ls1" stroke="#f7f4ec" stroke-width="5" fill="none"/><path class="ls2" stroke="#f7f4ec" stroke-width="5" fill="none"/><path class="lp" fill="#f7f4ec"/></g>
+            <g class="R"><path class="rs1" stroke="#f7f4ec" stroke-width="5" fill="none"/><path class="rs2" stroke="#f7f4ec" stroke-width="5" fill="none"/><path class="rp" fill="#f7f4ec"/></g></svg>`,
+            update(r,t){
+             const th=18*Math.exp(-2*t)*Math.cos(6.5*t)*(Math.PI/180), deg=th*180/Math.PI;
+             $(r,'.beam').setAttribute('transform',`rotate(${deg} 540 250)`);
+             const side=(sx,pre)=>{
+              const ex=540+sx*300*Math.cos(th), ey=250+sx*300*Math.sin(th), py=ey+250;
+              $(r,'.'+pre+'s1').setAttribute('d',`M${ex} ${ey} L${ex-110} ${py}`);
+              $(r,'.'+pre+'s2').setAttribute('d',`M${ex} ${ey} L${ex+110} ${py}`);
+              $(r,'.'+pre+'p').setAttribute('d',`M${ex-125} ${py} L${ex+125} ${py} A125 70 0 0 1 ${ex-125} ${py} Z`);
+             };
+             side(-1,'l'); side(1,'r');
+            }},
+           { svg:`<svg viewBox="0 0 1080 900">
+            ${[[210,'hos'],[540,'sch'],[870,'rod']].map(([x,k],i)=>`<g class="card" data-i="${i}" data-x="${x}"><rect x="${x-130}" y="260" width="260" height="260" rx="44" fill="#ffffff" fill-opacity=".1" stroke="${GOLD}" stroke-width="5"/>
+            ${k==='hos'?`<rect x="${x-24}" y="330" width="48" height="120" rx="8" fill="#fff"/><rect x="${x-60}" y="366" width="120" height="48" rx="8" fill="#fff"/>`:''}
+            ${k==='sch'?`<polygon points="${x-90},360 ${x},300 ${x+90},360" fill="${GOLD}"/><rect x="${x-72}" y="360" width="144" height="100" fill="#fff"/><rect x="${x-18}" y="400" width="36" height="60" fill="#27407f"/>`:''}
+            ${k==='rod'?`<polygon points="${x-30},300 ${x+30},300 ${x+90},470 ${x-90},470" fill="#4b5a85"/><path d="M${x} 310 V330 M${x} 360 V385 M${x} 410 V445" stroke="#fff" stroke-width="8" stroke-linecap="round"/>`:''}</g>
+            <g class="coin" data-x="${x}"><circle cx="${x}" cy="0" r="46" fill="${GOLD}"/><text x="${x}" y="18" text-anchor="middle" font-size="54" fill="${INK}" font-family="'Noto Sans Thai',sans-serif" font-weight="700">฿</text></g>
+            <text x="${x}" y="610" text-anchor="middle" font-size="46" fill="#fff" font-family="'Noto Sans Thai',sans-serif" font-weight="700">${['โรงพยาบาล','โรงเรียน','ถนน'][i]}</text>`).join('')}</svg>`,
+            update(r,t){
+             r.querySelectorAll('.card').forEach((g,i)=>{
+              const s=E.back(seg(t,.3+i*.45,.9+i*.45)), x=+g.dataset.x;
+              g.setAttribute('transform',`translate(${x} 390) scale(${s}) translate(${-x} -390)`);
+             });
+             r.querySelectorAll('.coin').forEach((g,i)=>{
+              const a=.1+i*.45, p=E.out(seg(t,a,a+.7)), y=lerp(-140,200,p);
+              g.setAttribute('transform',`translate(0 ${y})`);
+              g.setAttribute('opacity',p<1?clamp(p*4)*1:1-seg(t,a+.7,a+1.0));
+             });
+            }},
+           { svg:`<svg viewBox="0 0 1080 900"><polygon class="roof" points="170,300 540,140 910,300" fill="${GOLD}"/>
+            ${[0,1,2].map(i=>`<rect class="pil" data-i="${i}" x="${235+i*250}" y="720" width="110" height="0" rx="10" fill="#f7f4ec"/>`).join('')}
+            <rect class="base" x="170" y="720" width="740" height="56" rx="14" fill="#27407f"/>
+            ${['โปร่งใส','ตรวจสอบได้','ยั่งยืน'].map((s,i)=>`<text class="lab" x="${290+i*250}" y="850" text-anchor="middle" font-size="44" fill="#fff" font-family="'Noto Sans Thai',sans-serif" font-weight="700">${s}</text>`).join('')}</svg>`,
+            update(r,t){
+             r.querySelectorAll('.pil').forEach((p,i)=>{
+              const h=420*E.out(seg(t,.2+i*.4,.9+i*.4));
+              p.setAttribute('height',h); p.setAttribute('y',720-h);
+             });
+             const s=E.back(seg(t,1.5,2.1));
+             $(r,'.roof').setAttribute('transform',`translate(540 300) scale(${s}) translate(-540 -300)`);
+             r.querySelectorAll('.lab').forEach((l,i)=>l.setAttribute('opacity',seg(t,1.0+i*.3,1.5+i*.3)));
+            }},
+           { svg:`<svg viewBox="0 0 1080 900"><g class="bub"><path d="M250 90 H830 A70 70 0 0 1 900 160 V400 A70 70 0 0 1 830 470 H520 L400 580 L420 470 H250 A70 70 0 0 1 180 400 V160 A70 70 0 0 1 250 90 Z" fill="#f7f4ec"/>
+            ${[0,1,2].map(i=>`<circle class="dot" data-i="${i}" cx="${420+i*120}" cy="280" r="30" fill="#27407f"/>`).join('')}</g>
+            <g class="btn"><rect x="270" y="650" width="540" height="150" rx="75" fill="#d6334a"/>
+            <text x="540" y="750" text-anchor="middle" font-size="72" fill="#fff" font-family="'Noto Sans Thai',sans-serif" font-weight="700">ติดตาม</text></g></svg>`,
+            update(r,t){
+             const b=E.back(seg(t,.1,.7));
+             $(r,'.bub').setAttribute('transform',`translate(540 330) scale(${b}) translate(-540 -330)`);
+             r.querySelectorAll('.dot').forEach((d,i)=>d.setAttribute('cy',280-22*Math.max(0,Math.sin(t*6-i*.9))));
+             const pulse=1+.06*Math.sin(t*5)*seg(t,1.2,1.6), pop=E.back(seg(t,1.0,1.6));
+             $(r,'.btn').setAttribute('transform',`translate(540 725) scale(${pop*pulse}) translate(-540 -725)`);
+            }}
+          ];
+          function lerp(a,b,t){return a+(b-a)*t}
+
+          /* ---------- Timeline wiring ---------- */
+          let TL=null, nodes=[];
+          function split(text){
+           const sg=new Intl.Segmenter('th',{granularity:'word'});
+           return [...sg.segment(text)].map(s=>s.segment);
+          }
+          window.setTimeline=function(tl){
+           TL=tl; const host=document.getElementById('scenes'); host.innerHTML=''; nodes=[];
+           tl.scenes.forEach((s,i)=>{
+            const el=document.createElement('div'); el.className='scene';
+            const art=document.createElement('div'); art.className='art'; art.innerHTML=ART[i%ART.length].svg;
+            const txt=document.createElement('div'); txt.className='txt';
+            const inner=document.createElement('div');
+            const phrases=s.text.split(/\s+/).filter(Boolean);
+            const total=phrases.join('').length; let acc=0; const spans=[];
+            phrases.forEach((ph,pi)=>{
+             const box=document.createElement('span'); box.style.cssText='display:inline-block;opacity:1;white-space:nowrap;margin:0 .18em';
+             split(ph).forEach(w=>{const sp=document.createElement('span'); sp.textContent=w; box.appendChild(sp);
+              spans.push({sp,at:(acc/total)*s.speech*.92}); acc+=w.length;});
+             inner.appendChild(box);
+            });
+            txt.appendChild(inner); el.appendChild(art); el.appendChild(txt); host.appendChild(el);
+            nodes.push({el,art,spans});
+           });
+          };
+          window.seek=function(T){
+           TL.scenes.forEach((s,i)=>{
+            const n=nodes[i], t=T-s.start, last=i===TL.scenes.length-1;
+            if(t<-.01||t>=s.dur){n.el.style.opacity=0;n.el.style.display='none';return;}
+            n.el.style.display='block';
+            const fin=E.out(seg(t,0,.35)), fout=last?1:1-seg(t,s.dur-.25,s.dur);
+            n.el.style.opacity=fin*fout;
+            n.art.style.transform=`translateY(${(1-fin)*30}px)`;
+            ART[i%ART.length].update(n.art,t);
+            n.spans.forEach(w=>{
+             const p=E.out(seg(t,w.at,w.at+.28));
+             w.sp.style.opacity=p; w.sp.style.transform=`translateY(${(1-p)*22}px)`;
+            });
+           });
+           document.querySelector('#bar b').style.width=(100*clamp(T/TL.total))+'%';
+          };
+          </script></body></html>
+          EOF_FILE
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-thai-tlwg
+          npm install
+          npx playwright install --with-deps chromium
+      - name: Generate voice (Paxa TTS)
+        env:
+          PAXA_API_KEY: ${{ secrets.PAXA_API_KEY }}
+        run: node scripts/tts.mjs
+      - name: Render video
+        run: node scripts/render.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video
+          path: out/video.mp4
+          
