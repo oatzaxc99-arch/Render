@@ -1,0 +1,19 @@
+{
+  "name": "hf-thai-video",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tts": "node scripts/tts.mjs",
+    "build": "node scripts/build.mjs",
+    "lint": "hyperframes lint",
+    "preview": "hyperframes preview",
+    "render": "hyperframes render",
+    "all": "node scripts/tts.mjs && node scripts/build.mjs && hyperframes lint && hyperframes render"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "hyperframes": "latest"
+  }
+}

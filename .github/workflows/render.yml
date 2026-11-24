@@ -1,0 +1,63 @@
+name: Render video
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - project.json
+      - scripts/**
+      - assets/music.mp3
+      - .github/workflows/render.yml
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: System deps (FFmpeg + Thai fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-thai-tlwg fonts-noto-color-emoji
+          fc-cache -f
+
+      - name: Install
+        run: npm install
+
+      - name: TTS (Paxa Labs)
+        env:
+          PAXA_API_KEY: ${{ secrets.PAXA_API_KEY }}
+        run: npm run tts
+
+      - name: Build composition
+        run: npm run build
+
+      - name: Lint composition
+        run: npx hyperframes lint
+
+      - name: Render
+        run: npx hyperframes render
+
+      - name: Locate output
+        run: find . -name "*.mp4" -not -path "./node_modules/*" -print
+
+      - name: Upload video
+        uses: actions/upload-artifact@v4
+        with:
+          name: video
+          path: |
+            **/*.mp4
+            !node_modules/**
+          if-no-files-found: error
+
+      - name: Upload narration audio
+        uses: actions/upload-artifact@v4
+        with:
+          name: narration
+          path: assets/audio/*.mp3
