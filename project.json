@@ -6,7 +6,7 @@
     "duration": 44
   },
   "tts": {
-    "voiceId": "bcdIY58WBBzAMmef52NW",
+    "voiceId": "TX3LPaxmHKxFdv7VOQHJ",
     "modelId": "eleven_multilingual_v2",
     "stability": 0.5,
     "similarityBoost": 0.75
