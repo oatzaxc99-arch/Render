@@ -11,7 +11,7 @@ const cfg = JSON.parse(readFileSync("project.json", "utf8"));
 const key = process.env.PAXA_API_KEY;
 
 if (!key) {
-  console.error('Missing PAXA_API_KEY (create one at https://paxalabs.com/app/keys)');
+  console.error("Missing PAXA_API_KEY");
   process.exit(1);
 }
 
@@ -25,34 +25,42 @@ const hashes = existsSync(hashFile)
   ? JSON.parse(readFileSync(hashFile, "utf8"))
   : {};
 
-// Paxa limit: 10 requests/minute.
-// Use a conservative 7-second interval between successful requests.
-const REQUEST_GAP_MS = 7000;
+// Conservative Paxa request pacing.
+const REQUEST_GAP_MS = 65_000;
 const MAX_RETRIES = 5;
 
-function getRetryDelay(res, retryNumber) {
-  const retryAfter = res?.headers?.get("retry-after");
+let nextRequestAt = 0;
 
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
+async function waitForRequestSlot() {
+  const remaining = nextRequestAt - Date.now();
 
-    if (Number.isFinite(seconds) && seconds >= 0) {
-      return Math.ceil(seconds * 1000);
-    }
+  if (remaining > 0) {
+    console.log(`wait  ${Math.ceil(remaining / 1000)}s before next request`);
+    await sleep(remaining);
+  }
+}
 
-    const retryDate = Date.parse(retryAfter);
+function getRetryAfterMs(res) {
+  const value = res.headers.get("retry-after");
+  if (!value) return 0;
 
-    if (Number.isFinite(retryDate)) {
-      return Math.max(0, retryDate - Date.now());
-    }
+  const seconds = Number(value);
+
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
   }
 
-  // 7s, 14s, 28s, 56s, 60s
-  return Math.min(REQUEST_GAP_MS * (2 ** (retryNumber - 1)), 60000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
 }
 
 async function requestTTS(scene, name, sceneVoice, sceneSpeed) {
   for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+    await waitForRequestSlot();
+
+    // Reserve the next request slot, including retries.
+    nextRequestAt = Date.now() + REQUEST_GAP_MS;
+
     let res;
 
     try {
@@ -73,20 +81,16 @@ async function requestTTS(scene, name, sceneVoice, sceneSpeed) {
     } catch (error) {
       if (attempt > MAX_RETRIES) {
         throw new Error(
-          `Network request failed for ${name} after ${MAX_RETRIES} retries: ${error.message}`
+          `Network error for ${name} after ${MAX_RETRIES} retries: ${error.message}`
         );
       }
 
-      const delay = Math.min(
-        REQUEST_GAP_MS * (2 ** (attempt - 1)),
-        60000
-      );
+      const delay = Math.min(120_000 * attempt, 360_000);
+      nextRequestAt = Math.max(nextRequestAt, Date.now() + delay);
 
       console.warn(
-        `Network error for ${name}. Retry ${attempt}/${MAX_RETRIES} in ${Math.ceil(delay / 1000)}s`
+        `Network error. Retry ${attempt}/${MAX_RETRIES} after ${Math.ceil(delay / 1000)}s`
       );
-
-      await sleep(delay);
       continue;
     }
 
@@ -95,7 +99,6 @@ async function requestTTS(scene, name, sceneVoice, sceneSpeed) {
     }
 
     const body = await res.text().catch(() => "");
-
     const retryable = res.status === 429 || res.status === 408 ||
       res.status === 425 || res.status >= 500;
 
@@ -105,17 +108,24 @@ async function requestTTS(scene, name, sceneVoice, sceneSpeed) {
       );
     }
 
-    const delay = getRetryDelay(res, attempt);
+    let delay;
 
-    console.warn(
-      `Paxa HTTP ${res.status} for ${name}. Retry ${attempt}/${MAX_RETRIES} in ${Math.ceil(delay / 1000)}s`
-    );
-
-    if (body) {
-      console.warn(body);
+    if (res.status === 429) {
+      // 120s, 180s, 240s, 300s, 360s.
+      const progressiveDelay = 120_000 + (attempt - 1) * 60_000;
+      const providerDelay = getRetryAfterMs(res);
+      delay = Math.max(progressiveDelay, providerDelay);
+    } else {
+      delay = Math.min(60_000 * attempt, 300_000);
     }
 
-    await sleep(delay);
+    nextRequestAt = Math.max(nextRequestAt, Date.now() + delay);
+
+    console.warn(
+      `Paxa HTTP ${res.status}. Retry ${attempt}/${MAX_RETRIES} after ${Math.ceil(delay / 1000)}s`
+    );
+
+    if (body) console.warn(body);
   }
 
   throw new Error(`TTS failed unexpectedly for ${name}`);
@@ -142,12 +152,6 @@ for (const [i, scene] of cfg.scenes.entries()) {
     continue;
   }
 
-  // Keep a safe interval between requests.
-  if (i > 0) {
-    console.log("wait  7 seconds (Paxa rate limit)");
-    await sleep(REQUEST_GAP_MS);
-  }
-
   console.log(`tts   ${name}  voice=${sceneVoice}`);
 
   const audio = await requestTTS(
@@ -159,7 +163,6 @@ for (const [i, scene] of cfg.scenes.entries()) {
 
   writeFileSync(path, audio);
 
-  // Update cache only after audio has been successfully saved.
   hashes[name] = sig;
   writeFileSync(hashFile, JSON.stringify(hashes, null, 2));
 
