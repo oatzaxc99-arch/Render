@@ -123,7 +123,7 @@ const sceneHtml = scenes
 const audioHtml = scenes
   .map(
     ({ audio, d, start }, i) =>
-      `    <audio id="audio-s${i + 1}" src="${audio}" data-start="${(start + LEAD).toFixed(3)}" data-duration="${d.toFixed(3)}" data-track-index="10" data-volume="1"></audio>`,
+      `    <audio id="bcdIY58WBBzAMmef52NW-s${i + 1}" src="${audio}" data-start="${(start + LEAD).toFixed(3)}" data-duration="${d.toFixed(3)}" data-track-index="10" data-volume="1"></audio>`,
   )
   .join("\n");
 
