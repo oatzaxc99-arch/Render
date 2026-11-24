@@ -12,7 +12,7 @@
     "similarityBoost": 0.75
   },
   "style": {
-    "font": "'Noto Sans Thai', 'Sarabun', 'Loma', sans-serif",
+    "font": "'Noto Sans Thai', 'Sarabun', sans-serif",
     "textColor": "#ffffff",
     "accent": "#fcd34d",
     "bg": [
