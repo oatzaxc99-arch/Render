@@ -30,6 +30,17 @@ jobs:
       - name: Install
         run: npm install
 
+      - name: Check ELEVENLABS_API_KEY secret
+        env:
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+        run: |
+          if [ -z "$ELEVENLABS_API_KEY" ]; then
+            echo "❌ ELEVENLABS_API_KEY is EMPTY — go to repo Settings → Secrets and variables → Actions → New repository secret"
+            exit 1
+          else
+            echo "✅ ELEVENLABS_API_KEY is set (length: ${#ELEVENLABS_API_KEY})"
+          fi
+
       - name: TTS (ElevenLabs)
         env:
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
