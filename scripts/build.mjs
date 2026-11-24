@@ -122,8 +122,8 @@ const sceneHtml = scenes
 
 const audioHtml = scenes
   .map(
-    ({ audio, d, start }) =>
-      `    <audio src="${audio}" data-start="${(start + LEAD).toFixed(3)}" data-duration="${d.toFixed(3)}" data-track-index="10" data-volume="1"></audio>`,
+    ({ audio, d, start }, i) =>
+      `    <audio id="audio-s${i + 1}" src="${audio}" data-start="${(start + LEAD).toFixed(3)}" data-duration="${d.toFixed(3)}" data-track-index="10" data-volume="1"></audio>`,
   )
   .join("\n");
 
@@ -164,6 +164,9 @@ const html = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=${width}, height=${height}" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;500;800&family=Sarabun:wght@400;500;700&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: ${width}px; height: ${height}px; background: #000; overflow: hidden; }
