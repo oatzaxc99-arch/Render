@@ -30,9 +30,9 @@ jobs:
       - name: Install
         run: npm install
 
-      - name: TTS (Paxa Labs)
+      - name: TTS (ElevenLabs)
         env:
-          PAXA_API_KEY: ${{ secrets.PAXA_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
         run: npm run tts
 
       - name: Build composition
